@@ -24,31 +24,6 @@ for extra_env in [Path(__file__).parent / ".env", Path(__file__).resolve().paren
         pass
 
 
-def ensure_directory_exists(directory_path: Path) -> None:
-    """Create the directory if it does not exist."""
-    directory_path.mkdir(parents=True, exist_ok=True)
-
-
-def save_uploaded_files(files: List, base_backup_dir: Path) -> Tuple[Path, List[Path]]:
-    """Save uploaded files into a timestamped subfolder under the backup directory.
-
-    Returns the path to the created folder and list of saved file paths.
-    """
-    timestamp_folder = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_dir = base_backup_dir / timestamp_folder
-    ensure_directory_exists(backup_dir)
-
-    saved_paths: List[Path] = []
-    for uploaded in files:
-        safe_name = os.path.basename(uploaded.name).replace("..", "_")
-        target_path = backup_dir / safe_name
-        with open(target_path, "wb") as f:
-            f.write(uploaded.getbuffer())
-        saved_paths.append(target_path)
-
-    return backup_dir, saved_paths
-
-
 # -------------- Env helpers --------------
 
 def get_env_any(keys: List[str], default: str = "") -> str:
@@ -97,6 +72,32 @@ def upload_to_cloudinary(
     except Exception:
         return None
 
+# NEW: direct-bytes upload for Streamlit Cloud (no local files)
+def upload_bytes_to_cloudinary(
+    file_bytes: bytes,
+    filename: str,
+    cloud_name: str,
+    api_key: str,
+    api_secret: str,
+    folder: Optional[str] = None,
+) -> Optional[str]:
+    try:
+        timestamp = int(time.time())
+        url = f"https://api.cloudinary.com/v1_1/{cloud_name}/image/upload"
+        params = {"timestamp": str(timestamp)}
+        if folder:
+            params["folder"] = folder
+        signature = _cloudinary_signature(params, api_secret)
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        files = {"file": (filename, file_bytes, mime_type)}
+        data = {"api_key": api_key, "signature": signature, **params}
+        resp = requests.post(url, data=data, files=files, timeout=60)
+        if resp.status_code == 200:
+            return resp.json().get("secure_url")
+        return None
+    except Exception:
+        return None
+
 
 def upload_to_imgbb(file_path: Path, api_key: str) -> Optional[str]:
     """Upload an image to imgbb; return URL or None."""
@@ -121,9 +122,9 @@ def send_via_mailgun(
     recipient: str,
     subject: str,
     text: str,
-    attachment_paths: List[Path],
+    attachments: List[Tuple[str, bytes, str]],
 ) -> None:
-    """Send email through Mailgun with optional attachments."""
+    """Send email through Mailgun with in-memory attachments."""
     url = f"https://api.mailgun.net/v3/{domain}/messages"
     data = {
         "from": sender,
@@ -132,31 +133,21 @@ def send_via_mailgun(
         "text": text,
     }
 
-    files = []
-    try:
-        for p in attachment_paths:
-            mime_type = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
-            files.append(("attachment", (p.name, open(p, "rb"), mime_type)))
-        resp = requests.post(url, auth=("api", api_key), data=data, files=files, timeout=60)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Mailgun error {resp.status_code}: {resp.text}")
-    finally:
-        for _, (_, fh, _) in files:
-            try:
-                fh.close()
-            except Exception:
-                pass
+    files: List[Tuple[str, Tuple[str, bytes, str]]] = []
+    for name, content_bytes, mime_type in attachments:
+        files.append(("attachment", (name, content_bytes, mime_type)))
+
+    resp = requests.post(url, auth=("api", api_key), data=data, files=files, timeout=60)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Mailgun error {resp.status_code}: {resp.text}")
 
 
 def main() -> None:
     st.set_page_config(page_title="SS-SEND: Image Mailer", page_icon="📧", layout="centered")
     st.title("📧 SS-SEND: Send Images via Email")
-    st.caption("Upload one or more images, send via Mailgun, with local backup and optional remote hosting.")
+    st.caption("Upload images, they are uploaded to Cloudinary and emailed via Mailgun. No local storage.")
 
     # Resolve defaults and env
-    app_dir = Path(__file__).parent.resolve()
-    default_backup_dir = app_dir / "backups"
-
     MAILGUN_API_KEY = get_env_any(["MAILGUN_API_KEY"]) 
     MAILGUN_DOMAIN = get_env_any(["MAILGUN_DOMAIN"]) 
     MAILGUN_SENDER = get_env_any(["MAILGUN_SENDER", "MAILGUN_FROM", "MAILGUN_SENDER_EMAIL"]) 
@@ -166,36 +157,10 @@ def main() -> None:
     CLOUDINARY_API_SECRET = get_env_any(["CLOUDINARY_API_SECRET", "CLOUD_API_SECRET", "API_SECRET"]) 
     CLOUDINARY_FOLDER = get_env_any(["CLOUDINARY_FOLDER", "CLOUD_FOLDER", "FOLDER"]) 
 
-    IMGBB_API_KEY = get_env_any(["IMGBB_API_KEY", "IMG_BB_API_KEY"]) 
-
-    with st.sidebar:
-        st.header("Environment status")
-        mg_ready = all([MAILGUN_API_KEY, MAILGUN_DOMAIN, MAILGUN_SENDER])
-        st.write(f"Mailgun configured: {'✅' if mg_ready else '❌'}")
-        cloudinary_ready = all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET])
-        imgbb_ready = bool(IMGBB_API_KEY)
-        st.write(f"Cloudinary: {'✅' if cloudinary_ready else '❌'} | imgbb: {'✅' if imgbb_ready else '❌'}")
-
-        with st.expander("Troubleshooting"):
-            st.write(f".env detected at: {DOTENV_PATH or 'not found'}")
-            st.write(f"CLOUDINARY_CLOUD_NAME set: {bool(CLOUDINARY_CLOUD_NAME)}")
-            st.write(f"CLOUDINARY_API_KEY set: {bool(CLOUDINARY_API_KEY)}")
-            st.write(f"CLOUDINARY_API_SECRET set: {bool(CLOUDINARY_API_SECRET)}")
-            st.write(f"CLOUDINARY_FOLDER set: {bool(CLOUDINARY_FOLDER)}")
-
-        st.divider()
-        st.header("Backup & Hosting Settings")
-        backup_base = st.text_input("Backup folder", value=str(default_backup_dir))
-        auto_open_folder = st.toggle("Open backup folder after save", value=False)
-        enable_remote_hosting = st.toggle("Upload to image host (if configured)", value=cloudinary_ready or imgbb_ready)
-        preferred_host = st.selectbox(
-            "Preferred host",
-            options=[opt for opt, ok in [("cloudinary", cloudinary_ready), ("imgbb", imgbb_ready)] if ok] or ["none"],
-            index=0,
-        )
-        cloudinary_folder_input = ""
-        if cloudinary_ready:
-            cloudinary_folder_input = st.text_input("Cloudinary folder (optional)", value=CLOUDINARY_FOLDER, help="e.g., 'ss-send/uploads'")
+    # Prepare readiness flags (not displayed)
+    mg_ready = all([MAILGUN_API_KEY, MAILGUN_DOMAIN, MAILGUN_SENDER])
+    cloudinary_ready = all([CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET])
+    cloudinary_folder_input = CLOUDINARY_FOLDER
 
     uploaded_files = st.file_uploader(
         "Upload image file(s)",
@@ -204,8 +169,6 @@ def main() -> None:
     )
 
     recipient_email = st.text_input("Recipient email")
-    default_from_display = MAILGUN_SENDER or "sender@example.com"
-    from_display = st.text_input("Sender (from)", value=default_from_display, help="Uses MAILGUN_SENDER by default")
     subject = st.text_input("Subject", value="Your images from SS-SEND")
     body = st.text_area("Message", value="Please find the attached images.")
 
@@ -214,12 +177,11 @@ def main() -> None:
         cols = st.columns(3)
         for idx, uf in enumerate(uploaded_files):
             with cols[idx % 3]:
-                st.image(uf, caption=uf.name, use_column_width=True)
+                st.image(uf, caption=uf.name, use_container_width=True)
 
-    send_clicked = st.button("Send with Mailgun and Backup", type="primary")
+    send_clicked = st.button("Upload to Cloudinary and Send Email", type="primary")
 
     if send_clicked:
-        # Validation
         if not uploaded_files:
             st.error("Please upload at least one image.")
             return
@@ -229,44 +191,44 @@ def main() -> None:
         if not mg_ready:
             st.error("Mailgun is not configured. Please set MAILGUN_API_KEY, MAILGUN_DOMAIN, MAILGUN_SENDER in your .env.")
             return
+        if not cloudinary_ready:
+            st.error("Cloudinary is not configured. Please set CLOUDINARY_* vars in your .env.")
+            return
 
-        base_dir = Path(backup_base).expanduser().resolve()
         try:
-            with st.spinner("Saving backup, uploading (optional), and sending email..."):
-                # Save backup
-                backup_folder, saved_paths = save_uploaded_files(uploaded_files, base_dir)
-
-                # Optional remote upload
+            with st.spinner("Uploading to Cloudinary and sending email..."):
                 remote_urls: List[str] = []
-                if enable_remote_hosting and saved_paths:
-                    for path in saved_paths:
-                        url: Optional[str] = None
-                        if preferred_host == "cloudinary" and cloudinary_ready:
-                            url = upload_to_cloudinary(
-                                path,
-                                CLOUDINARY_CLOUD_NAME,
-                                CLOUDINARY_API_KEY,
-                                CLOUDINARY_API_SECRET,
-                                folder=cloudinary_folder_input or None,
-                            )
-                        elif preferred_host == "imgbb" and imgbb_ready:
-                            url = upload_to_imgbb(path, IMGBB_API_KEY)
-                        if url:
-                            remote_urls.append(url)
+                attachments: List[Tuple[str, bytes, str]] = []
+                for uf in uploaded_files:
+                    file_bytes = uf.getbuffer()
+                    filename = uf.name
+                    url = upload_bytes_to_cloudinary(
+                        file_bytes=file_bytes,
+                        filename=filename,
+                        cloud_name=CLOUDINARY_CLOUD_NAME,
+                        api_key=CLOUDINARY_API_KEY,
+                        api_secret=CLOUDINARY_API_SECRET,
+                        folder=cloudinary_folder_input or None,
+                    )
+                    if url:
+                        remote_urls.append(url)
+                    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                    attachments.append((filename, file_bytes, mime_type))
 
-                # Compose email body
+                if len(remote_urls) != len(uploaded_files):
+                    st.warning("Some Cloudinary uploads did not return URLs. Check your configuration.")
+
                 url_block = "\n\nLinks:\n" + "\n".join(remote_urls) if remote_urls else ""
-                email_body = f"{body}{url_block}\n\nTotal attachments: {len(saved_paths)}\nBackup folder: {backup_folder}"
+                email_body = f"{body}{url_block}\n\nTotal images: {len(uploaded_files)}"
 
-                # Send via Mailgun with attachments
                 send_via_mailgun(
                     api_key=MAILGUN_API_KEY,
                     domain=MAILGUN_DOMAIN,
-                    sender=from_display or MAILGUN_SENDER,
+                    sender=MAILGUN_SENDER,
                     recipient=recipient_email,
                     subject=subject,
                     text=email_body,
-                    attachment_paths=saved_paths,
+                    attachments=attachments,
                 )
         except requests.RequestException as re:
             st.error(f"Network error: {re}")
@@ -275,20 +237,7 @@ def main() -> None:
             st.error(f"Failed to complete operation: {e}")
             return
 
-        st.success("Email sent, backup saved, and uploads (if enabled) completed!")
-        st.info(f"Backup folder: {backup_folder}")
-
-        if enable_remote_hosting and not remote_urls:
-            st.warning("Remote hosting was enabled but no URLs were returned. Check your hosting configuration.")
-
-        if auto_open_folder:
-            try:
-                if os.name == "nt":
-                    os.startfile(str(backup_folder))  # type: ignore[attr-defined]
-                elif os.name == "posix":
-                    os.system(f"xdg-open '{backup_folder}' >/dev/null 2>&1 &")
-            except Exception:
-                pass
+        st.success("Uploaded to Cloudinary and emailed successfully!")
 
 
 if __name__ == "__main__":
